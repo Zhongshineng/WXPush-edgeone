@@ -155,7 +155,12 @@ export async function onRequest(context) {
     const body = await request.json().catch(() => ({}));
     const scene = String(body.scene || '');
     if (!isScene(scene)) return json({ msg: 'Invalid scene' }, 400);
-    return json({ openUrl: createAuthorizationUrl(url.origin, scene, env) });
+    const followQr = await createFollowQr(scene, env);
+    return json({
+      followImageUrl: followQr.imageUrl,
+      followOpenUrl: followQr.openUrl,
+      openUrl: createAuthorizationUrl(url.origin, scene, env),
+    });
   } catch {
     return json({ msg: 'Unable to create binding link' }, 502);
   }
