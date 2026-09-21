@@ -111,6 +111,73 @@ const SKINS = {
 };
 
 const DEFAULT_SKIN_KEY = 'warm-magazine';
+const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
+const DEFAULT_TOKEN_LIFETIME_SECONDS = 7200;
+const UPSTREAM_TIMEOUT_MS = 4000;
+const INVALID_TOKEN_CODES = new Set([40014, 42001]);
+const RETRYABLE_WECHAT_CODES = new Set([-1, 45009]);
+const tokenCache = new Map();
+const tokenRequests = new Map();
+
+class WxSendError extends Error {
+  constructor(message, { stage = 'unknown', code = 'UNKNOWN', status = 500, retryable = false } = {}) {
+    super(message);
+    this.name = 'WxSendError';
+    this.stage = stage;
+    this.code = code;
+    this.status = status;
+    this.retryable = retryable;
+  }
+}
+
+function json(payload, status = 200) {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+  });
+}
+
+function logWxSend(event, details = {}) {
+  console.info(JSON.stringify({ event, ...details }));
+}
+
+export async function fetchJsonWithTimeout(url, options = {}, { stage, timeoutMs = UPSTREAM_TIMEOUT_MS } = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const startedAt = Date.now();
+
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new WxSendError(`Upstream ${stage} request failed.`, {
+        stage,
+        code: Number(data?.errcode || response.status),
+        status: response.status >= 500 ? 502 : response.status,
+        retryable: response.status === 408 || response.status === 429 || response.status >= 500,
+      });
+    }
+    return { data, durationMs: Date.now() - startedAt };
+  } catch (error) {
+    if (error instanceof WxSendError) throw error;
+    if (controller.signal.aborted) {
+      throw new WxSendError(`Upstream ${stage} request timed out.`, {
+        stage,
+        code: 'UPSTREAM_TIMEOUT',
+        status: 504,
+        retryable: true,
+      });
+    }
+    throw new WxSendError(`Upstream ${stage} request failed.`, {
+      stage,
+      code: 'UPSTREAM_NETWORK_ERROR',
+      status: 502,
+      retryable: true,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 function getSkinByKey(skinKey) {
   const key = (skinKey || '').toString().trim().toLowerCase();
@@ -182,10 +249,7 @@ export async function onRequest(context) {
   
   if (requestToken) {
     if (requestToken !== env.API_TOKEN) {
-      return new Response(JSON.stringify({ msg: 'Token错误，无权使用内置配置 (Forbidden)' }), {
-        status: 403,
-        headers: { 'Content-Type': 'application/json; charset=utf-8' },
-      });
+      return json({ success: false, stage: 'auth', code: 'FORBIDDEN', retryable: false, msg: 'Token错误，无权使用内置配置 (Forbidden)' }, 403);
     }
     // Token is valid: Allow fallback to env variables
     appid = params.appid || env.WX_APPID;
@@ -206,10 +270,13 @@ export async function onRequest(context) {
   }
 
   if (missingParams.length > 0) {
-    return new Response(JSON.stringify({ msg: 'Missing required parameters: ' + missingParams.join(', ') }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json; charset=utf-8' },
-    });
+    return json({
+      success: false,
+      stage: 'validation',
+      code: 'MISSING_PARAMETERS',
+      retryable: false,
+      msg: 'Missing required parameters: ' + missingParams.join(', '),
+    }, 400);
   }
 
   const skin = getSkinByKey(params.skin || env.WX_SKIN);
@@ -217,14 +284,9 @@ export async function onRequest(context) {
 
   const user_list = useridStr.split('|').map(uid => uid.trim()).filter(Boolean);
 
+  const startedAt = Date.now();
   try {
-    const accessToken = await getStableToken(appid, secret);
-    if (!accessToken) {
-      return new Response(JSON.stringify({ msg: 'Failed to get access token. 请检查 APPID 和 SECRET 是否正确，以及 IP 白名单是否已配置（如为正式公众号）。' }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json; charset=utf-8' },
-      });
-    }
+    let tokenResult = await getStableToken(appid, secret);
 
     const beijingTime = new Date(new Date().getTime() + 8 * 60 * 60 * 1000);
     const date = beijingTime.toISOString().slice(0, 19).replace('T', ' ');
@@ -235,52 +297,130 @@ export async function onRequest(context) {
     jumpUrl.searchParams.set('title', title);
     const jumpUrlStr = jumpUrl.toString();
 
-    const results = await Promise.all(user_list.map(userid =>
-      sendMessage(accessToken, userid, template_id, jumpUrlStr, title, content)
+    let results = await Promise.all(user_list.map(userid =>
+      sendMessage(tokenResult.accessToken, userid, template_id, jumpUrlStr, title, content)
     ));
 
-    const successfulMessages = results.filter(r => r.errmsg === 'ok');
+    const invalidTokenIndexes = results
+      .map((result, index) => INVALID_TOKEN_CODES.has(Number(result?.errcode)) ? index : -1)
+      .filter(index => index >= 0);
 
-    if (successfulMessages.length > 0) {
-      return new Response(JSON.stringify({
-        msg: `Successfully sent messages to ${successfulMessages.length} user(s). First response: ok`,
-        skin: skin.slug,
-        jump_url: jumpUrlStr,
-      }), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    if (invalidTokenIndexes.length > 0) {
+      tokenResult = await getStableToken(appid, secret, { forceRefresh: true });
+      const refreshed = await Promise.all(invalidTokenIndexes.map(index =>
+        sendMessage(tokenResult.accessToken, user_list[index], template_id, jumpUrlStr, title, content)
+      ));
+      invalidTokenIndexes.forEach((resultIndex, refreshedIndex) => {
+        results[resultIndex] = refreshed[refreshedIndex];
       });
     }
 
-    const firstError = results.length > 0 ? results[0].errmsg : 'Unknown error';
-    return new Response(JSON.stringify({ msg: `Failed to send messages. First error: ${firstError}` }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    const successfulMessages = results.filter(r => Number(r?.errcode || 0) === 0 && r?.errmsg === 'ok');
+    const failedMessages = results.length - successfulMessages.length;
+
+    if (successfulMessages.length > 0) {
+      logWxSend('wxsend_completed', {
+        status: 'success',
+        sent: successfulMessages.length,
+        failed: failedMessages,
+        tokenCacheHit: tokenResult.cacheHit,
+        durationMs: Date.now() - startedAt,
+      });
+      return json({
+        success: true,
+        sent: successfulMessages.length,
+        failed: failedMessages,
+        tokenCacheHit: tokenResult.cacheHit,
+        msg: `Successfully sent messages to ${successfulMessages.length} user(s). First response: ok`,
+        skin: skin.slug,
+        jump_url: jumpUrlStr,
+      });
+    }
+
+    const firstResult = results[0] || {};
+    const firstCode = Number(firstResult.errcode || 0) || 'WECHAT_SEND_FAILED';
+    const retryable = RETRYABLE_WECHAT_CODES.has(Number(firstResult.errcode));
+    logWxSend('wxsend_failed', {
+      stage: 'send',
+      code: firstCode,
+      retryable,
+      durationMs: Date.now() - startedAt,
     });
+    return json({
+      success: false,
+      stage: 'send',
+      code: firstCode,
+      retryable,
+      msg: `Failed to send messages. First error: ${firstResult.errmsg || 'Unknown error'}`,
+      message: 'WeChat template message delivery failed.',
+    }, 500);
   } catch (error) {
-    console.error('Error:', error);
-    return new Response(JSON.stringify({ msg: `An error occurred: ${error.message}` }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    const safeError = error instanceof WxSendError
+      ? error
+      : new WxSendError('Unexpected wxsend failure.');
+    logWxSend('wxsend_failed', {
+      stage: safeError.stage,
+      code: safeError.code,
+      retryable: safeError.retryable,
+      durationMs: Date.now() - startedAt,
     });
+    return json({
+      success: false,
+      stage: safeError.stage,
+      code: safeError.code,
+      retryable: safeError.retryable,
+      msg: `An error occurred: ${safeError.message}`,
+      message: safeError.message,
+    }, safeError.status);
   }
 }
 
-async function getStableToken(appid, secret) {
+async function getStableToken(appid, secret, { forceRefresh = false } = {}) {
+  const cached = tokenCache.get(appid);
+  if (!forceRefresh && cached && cached.expiresAt - TOKEN_REFRESH_SKEW_MS > Date.now()) {
+    return { accessToken: cached.accessToken, cacheHit: true };
+  }
+
+  if (tokenRequests.has(appid)) {
+    return tokenRequests.get(appid);
+  }
+
+  if (forceRefresh) tokenCache.delete(appid);
   const tokenUrl = 'https://api.weixin.qq.com/cgi-bin/stable_token';
-  const payload = {
-    grant_type: 'client_credential',
-    appid: appid,
-    secret: secret,
-    force_refresh: false,
-  };
-  const response = await fetch(tokenUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json;charset=utf-8' },
-    body: JSON.stringify(payload),
-  });
-  const data = await response.json();
-  return data.access_token;
+  const request = (async () => {
+    const { data } = await fetchJsonWithTimeout(tokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json;charset=utf-8' },
+      body: JSON.stringify({
+        grant_type: 'client_credential',
+        appid,
+        secret,
+        force_refresh: forceRefresh,
+      }),
+    }, { stage: 'token' });
+
+    if (!data.access_token) {
+      throw new WxSendError('Failed to get access token.', {
+        stage: 'token',
+        code: Number(data.errcode || 0) || 'TOKEN_MISSING',
+        status: 502,
+        retryable: Number(data.errcode) === -1,
+      });
+    }
+
+    tokenCache.set(appid, {
+      accessToken: data.access_token,
+      expiresAt: Date.now() + Math.max(Number(data.expires_in || DEFAULT_TOKEN_LIFETIME_SECONDS), 60) * 1000,
+    });
+    return { accessToken: data.access_token, cacheHit: false };
+  })();
+
+  tokenRequests.set(appid, request);
+  try {
+    return await request;
+  } finally {
+    if (tokenRequests.get(appid) === request) tokenRequests.delete(appid);
+  }
 }
 
 async function sendMessage(accessToken, userid, template_id, target_url, title, content) {
@@ -296,11 +436,11 @@ async function sendMessage(accessToken, userid, template_id, target_url, title, 
     },
   };
 
-  const response = await fetch(sendUrl, {
+  const { data } = await fetchJsonWithTimeout(sendUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json;charset=utf-8' },
     body: JSON.stringify(payload),
-  });
+  }, { stage: 'send' });
 
-  return await response.json();
+  return data;
 }

@@ -93,7 +93,14 @@ curl -X POST "https://<你的域名>/wxsend" \
 * `HTTP 200`：即刻推送成功，Response JSON 将包含所采用的 `skin` 美化类别和成功拼接的长路径 `jump_url`。
 * `HTTP 400`：强类型约束拦截提示，如不带 token 也没填完自身微信号体系或者没有携带关键必须字段 content/title。
 * `HTTP 403`：安全防护，请求者如果非要尝试携带 Token 但未配对通过。
-* `HTTP 500`：Server 后端透传了腾讯微信接口产生的各类错误。极大概率因为获取微信 Access Token 失败（IP 白名单限制未关等因素，参照下文提示）。
+  * `HTTP 500`：Server 后端透传了腾讯微信接口产生的各类错误。极大概率因为获取微信 Access Token 失败（IP 白名单限制未关等因素，参照下文提示）。
+
+成功响应会额外返回 `success`、`sent`、`failed` 和 `tokenCacheHit`。失败响应会返回
+`success: false`、失败阶段 `stage`、安全错误码 `code` 及是否适合重试的 `retryable`；
+响应和服务端日志均不会输出 OpenID、AppSecret、API Token 或消息正文。
+
+服务端会在热实例内缓存微信 Access Token，并在过期前刷新；并发冷启动请求共享同一次
+Token 获取。微信返回 Access Token 失效或过期时，会强制刷新并重发一次。
 
 ## 🤖 AI 助手集成 (Skill)
 
